@@ -17,10 +17,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # Set up CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "https://motivola.vercel.app",
-    ],  # In production, specify the frontend URL
+    allow_origins=[origin.strip() for origin in settings.FRONTEND_URL.split(",")] if settings.FRONTEND_URL else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
