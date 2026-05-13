@@ -1,0 +1,26 @@
+# Node
+node_modules/
+.next/
+dist/
+build/
+npm-debug.log
+yarn-error.log
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+.qoder/
+.qodo/
+
+# Other
+*.log
