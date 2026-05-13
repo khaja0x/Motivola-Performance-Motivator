@@ -7,9 +7,9 @@ logger = logging.getLogger(__name__)
 
 class WhatsAppService:
     def __init__(self):
-        self.account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-        self.auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-        self.from_number = os.getenv("TWILIO_WHATSAPP_NUMBER") # e.g., 'whatsapp:+14155238886'
+        self.account_sid = settings.TWILIO_ACCOUNT_SID
+        self.auth_token = settings.TWILIO_AUTH_TOKEN
+        self.from_number = settings.TWILIO_WHATSAPP_NUMBER # e.g., 'whatsapp:+14155238886'
         
         self.client = None
         if self.account_sid and self.auth_token:
