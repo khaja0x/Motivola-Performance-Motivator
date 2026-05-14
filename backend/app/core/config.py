@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 480
     DEBUG: bool = False  # Default to False for production safety
     FRONTEND_URL: str = "http://localhost:3000"
+    BACKEND_URL: str = "http://localhost:8000"
 
     # Twilio (Optional, used for WhatsApp updates)
     TWILIO_ACCOUNT_SID: str | None = None

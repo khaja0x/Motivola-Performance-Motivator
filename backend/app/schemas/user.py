@@ -1,6 +1,7 @@
 from typing import Optional, Any, List
 from datetime import datetime
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
+from app.core.config import settings
 import uuid
 
 class Token(BaseModel):
@@ -87,35 +88,17 @@ class CompanyOut(BaseModel):
     staff_id_padding: int = 3
     staff_id_generation_mode: str = "Auto"
 
+    @field_validator("logo_url")
+    @classmethod
+    def assemble_logo_url(cls, v: Optional[str]) -> Optional[str]:
+        if v and v.startswith("/static"):
+            # Strip trailing slash from BACKEND_URL if present to avoid double slashes
+            base = settings.BACKEND_URL.rstrip("/")
+            return f"{base}{v}"
+        return v
+
     class Config:
         from_attributes = True
-
-class CompanyUpdate(BaseModel):
-    company_name: Optional[str] = Field(None, max_length=50, min_length=1)
-    industry: Optional[str] = Field(None, max_length=50)
-    currency: Optional[str] = Field(None, max_length=5)
-    currency_symbol: Optional[str] = Field(None, max_length=5)
-    timezone: Optional[str] = Field(None, max_length=50)
-    brand_display_name: Optional[str] = Field(None, max_length=50)
-    address: Optional[str] = Field(None, max_length=200)
-    logo_url: Optional[str] = Field(None, max_length=500)
-    fiscal_year_start: Optional[str] = Field(None, max_length=50)
-    default_sales_cycle: Optional[str] = Field(None, max_length=50)
-    tax_id: Optional[str] = Field(None, max_length=15) # Standard Tax ID size
-    whatsapp_api_key: Optional[str] = Field(None, max_length=255)
-    whatsapp_sender_id: Optional[str] = Field(None, max_length=50)
-    daily_nudge_time: Optional[str] = Field(None, max_length=10) # HH:MM format
-    ai_tone: Optional[str] = Field(None, max_length=30)
-    primary_source: Optional[str] = Field(None, max_length=100)
-    sync_frequency: Optional[str] = Field(None, max_length=50)
-    source_url: Optional[str] = Field(None, max_length=500)
-    integration_mappings: Optional[Any] = None
-    last_sync_at: Optional[datetime] = None
-    staff_id_prefix: Optional[str] = Field(None, max_length=20)
-    staff_id_suffix: Optional[str] = Field(None, max_length=20)
-    staff_id_start_number: Optional[int] = Field(None, ge=1)
-    staff_id_padding: Optional[int] = Field(None, ge=1, le=10)
-    staff_id_generation_mode: Optional[str] = Field(None, max_length=50)
 
 class UserProfileOut(BaseModel):
     user_id: uuid.UUID
@@ -129,3 +112,29 @@ class UserProfileOut(BaseModel):
 
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+
+class CompanyUpdate(BaseModel):
+    company_name: Optional[str] = None
+    industry: Optional[str] = None
+    currency: Optional[str] = None
+    currency_symbol: Optional[str] = None
+    timezone: Optional[str] = None
+    brand_display_name: Optional[str] = None
+    address: Optional[str] = None
+    fiscal_year_start: Optional[str] = None
+    default_sales_cycle: Optional[str] = None
+    tax_id: Optional[str] = None
+    whatsapp_api_key: Optional[str] = None
+    whatsapp_sender_id: Optional[str] = None
+    daily_nudge_time: Optional[str] = None
+    ai_tone: Optional[str] = None
+    primary_source: Optional[str] = None
+    sync_frequency: Optional[str] = None
+    source_url: Optional[str] = None
+    integration_mappings: Optional[Any] = None
+    staff_id_prefix: Optional[str] = None
+    staff_id_suffix: Optional[str] = None
+    staff_id_start_number: Optional[int] = None
+    staff_id_padding: Optional[int] = None
+    staff_id_generation_mode: Optional[str] = None

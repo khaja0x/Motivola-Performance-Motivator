@@ -1,22 +1,71 @@
-from datetime import timedelta
+import logging
 import re
+import shutil
+import uuid
+from datetime import timedelta
+from pathlib import Path
 from typing import Any
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, text
-from app.core import security
-from app.core.database import get_db
-from app.models.models import User, Company, Store
-from app.schemas.user import Token, UserLogin, UserCreate, UserOut, CompanyCreate, AdminCreate, CompanyOut
-from app.core.config import settings
 
+from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile
+from fastapi.responses import JSONResponse
+# pyrefly: ignore [missing-import]
+from sqlalchemy import select, text
+# pyrefly: ignore [missing-import]
+from sqlalchemy.ext.asyncio import AsyncSession
+# pyrefly: ignore [missing-import]
+from sqlalchemy.orm import selectinload
+
+from app.core import security
+from app.core.config import settings
+from app.core.database import get_db
+from app.api.deps import get_current_user, get_current_admin
+from app.models.models import User, Company, Store, Staff
+from app.schemas.user import (
+    Token, UserLogin, UserCreate, UserOut, 
+    CompanyCreate, AdminCreate, CompanyOut, 
+    UserProfileOut, UserUpdate, CompanyUpdate
+)
+from app.services.tenant_service import provision_tenant as provision_logic
+
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# --- Helper Functions ---
+
+async def switch_to_tenant(db: AsyncSession, company_slug: str):
+    """Safely switch the database session to a tenant's schema."""
+    schema_name = f"tenant_{company_slug}"
+    # Verify schema exists to prevent loud Postgres errors
+    schema_check = await db.execute(
+        text("SELECT schema_name FROM information_schema.schemata WHERE schema_name = :s"),
+        {"s": schema_name}
+    )
+    if not schema_check.fetchone():
+        logger.error(f"Attempted to switch to non-existent schema: {schema_name}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Database for '{company_slug}' is not provisioned."
+        )
+    await db.execute(text(f'SET search_path TO "{schema_name}", public'))
+    return schema_name
+
+async def reset_search_path(db: AsyncSession):
+    """Reset the search path to public."""
+    await db.execute(text("SET search_path TO public"))
+
+# --- Registration Routes ---
 
 @router.post("/register-company", response_model=CompanyOut)
 async def register_company(company_in: CompanyCreate, db: AsyncSession = Depends(get_db)) -> Any:
+    """Create a new company and provision its database schema."""
     # 1. Create Company
     slug = re.sub(r'[^a-z0-9]+', '-', company_in.company_name.lower()).strip('-')
     
+    # Check if slug exists
+    slug_check = await db.execute(select(Company).where(Company.company_slug == slug))
+    if slug_check.scalars().first():
+        slug = f"{slug}-{str(uuid.uuid4())[:4]}"
+
     new_company = Company(
         company_name=company_in.company_name,
         company_slug=slug,
@@ -31,59 +80,64 @@ async def register_company(company_in: CompanyCreate, db: AsyncSession = Depends
     await db.refresh(new_company)
     
     # 2. Provision Tenant Schema
-    from app.services.tenant_service import provision_tenant as provision_logic
-    await provision_logic(new_company.company_slug)
+    try:
+        await provision_logic(new_company.company_slug)
+        logger.info(f"Provisioned tenant schema for {new_company.company_slug}")
+    except Exception as e:
+        logger.error(f"Failed to provision tenant schema for {new_company.company_slug}: {e}")
+        # In production, we might want to flag this company as 'pending_provisioning'
     
     return new_company
 
 @router.post("/register-admin", response_model=UserOut)
 async def register_admin(user_in: AdminCreate, db: AsyncSession = Depends(get_db)) -> Any:
+    """Register an admin user for an existing company."""
     # 1. Check if user exists
     result = await db.execute(select(User).where(User.email == user_in.email))
-    user = result.scalars().first()
-    if user:
+    if result.scalars().first():
         raise HTTPException(status_code=400, detail="The user with this email already exists.")
     
-    # 2. Get company slug for search_path
+    # 2. Get company
     c_result = await db.execute(select(Company).where(Company.company_id == user_in.company_id))
     company = c_result.scalars().first()
     if not company:
         raise HTTPException(status_code=404, detail="Company not found.")
     
-    schema_name = f"tenant_{company.company_slug}"
-    
-    # 3. Create Default Store (strictly in tenant schema)
-    await db.execute(text(f'SET search_path TO "{schema_name}"'))
-    
-    default_store = Store(
-        company_id=user_in.company_id,
-        store_name="Main Branch",
-        location="Headquarters"
-    )
-    db.add(default_store)
-    
-    # 4. Create Admin User (The ONLY record for this Admin)
-    new_user = User(
-        email=user_in.email,
-        password_hash=security.get_password_hash(user_in.password),
-        full_name=user_in.full_name or user_in.email.split('@')[0],
-        company_id=user_in.company_id,
-        role="admin"
-    )
-    db.add(new_user)
-    
-    await db.commit()
-    await db.refresh(new_user)
-    return new_user
+    try:
+        # 3. Create Default Store (strictly in tenant schema)
+        await switch_to_tenant(db, company.company_slug)
+        
+        default_store = Store(
+            company_id=user_in.company_id,
+            store_name="Main Branch",
+            location="Headquarters"
+        )
+        db.add(default_store)
+        
+        # 4. Create Admin User (Strictly in public.users)
+        new_user = User(
+            email=user_in.email,
+            password_hash=security.get_password_hash(user_in.password),
+            full_name=user_in.full_name or user_in.email.split('@')[0],
+            company_id=user_in.company_id,
+            role="admin"
+        )
+        db.add(new_user)
+        
+        await db.commit()
+        await db.refresh(new_user)
+        return new_user
+    finally:
+        await reset_search_path(db)
 
 @router.post("/register", response_model=UserOut)
 async def register_combined(user_in: UserCreate, db: AsyncSession = Depends(get_db)) -> Any:
-    # Kept for compatibility but optimized
+    """Combines company registration and admin creation in one step."""
     result = await db.execute(select(User).where(User.email == user_in.email))
     if result.scalars().first():
         raise HTTPException(status_code=400, detail="Email already exists.")
     
-    # Step 1: Company
+    # 1. Create Company
     c_slug = re.sub(r'[^a-z0-9]+', '-', user_in.company_name.lower()).strip('-')
     new_company = Company(
         company_name=user_in.company_name,
@@ -95,66 +149,75 @@ async def register_combined(user_in: UserCreate, db: AsyncSession = Depends(get_
         brand_display_name=user_in.company_name
     )
     db.add(new_company)
-    await db.commit()
-    await db.refresh(new_company)
+    await db.flush()
     
-    # Provision
-    from app.services.tenant_service import provision_tenant
-    await provision_tenant(new_company.company_slug)
-    
-    # Step 2: Store creation (Strictly in tenant schema)
-    await db.execute(text(f'SET search_path TO "tenant_{new_company.company_slug}"'))
-    
-    default_store = Store(company_id=new_company.company_id, store_name="Main Branch")
-    db.add(default_store)
-    
-    # Step 2: User record (Global Admin - strictly in public.users)
-    new_user = User(
-        email=user_in.email,
-        password_hash=security.get_password_hash(user_in.password),
-        full_name=user_in.full_name or user_in.email.split('@')[0],
-        company_id=new_company.company_id,
-        role="admin"
-    )
-    db.add(new_user)
-    
-    await db.commit()
-    await db.refresh(new_user)
-    return new_user
+    try:
+        # 2. Provision Schema
+        await provision_logic(new_company.company_slug)
+        
+        # 3. Create Store in Tenant Schema
+        await switch_to_tenant(db, new_company.company_slug)
+        default_store = Store(company_id=new_company.company_id, store_name="Main Branch")
+        db.add(default_store)
+        
+        # 4. Create User in Public Schema
+        new_user = User(
+            email=user_in.email,
+            password_hash=security.get_password_hash(user_in.password),
+            full_name=user_in.full_name or user_in.email.split('@')[0],
+            company_id=new_company.company_id,
+            role="admin"
+        )
+        db.add(new_user)
+        
+        await db.commit()
+        await db.refresh(new_user)
+        return new_user
+    finally:
+        await reset_search_path(db)
+
+# --- Authentication ---
 
 @router.post("/login", response_model=Token)
 async def login(user_in: UserLogin, db: AsyncSession = Depends(get_db)) -> Any:
-    # 1. AUTH PATH A: Tenant-specific Login (Staff / Supervisors)
+    """Login for both Admin and Staff users."""
+    # PATH A: Tenant-specific Login (Staff / Supervisors)
     if user_in.company_slug:
-        schema_name = f"tenant_{user_in.company_slug}"
         try:
-            await db.execute(text(f'SET search_path TO "{schema_name}", public'))
+            await switch_to_tenant(db, user_in.company_slug)
             
-            # Look up in the Staff table of the tenant
-            from app.models.models import Staff
             result = await db.execute(select(Staff).where(Staff.email == user_in.email))
             staff = result.scalars().first()
             
             if staff and security.verify_password(user_in.password, staff.password_hash):
+                if staff.status != "active":
+                    raise HTTPException(status_code=403, detail="Staff account is inactive")
+                    
                 access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-                return {
+                token_data = {
                     "access_token": security.create_access_token(
                         staff.staff_id, 
                         expires_delta=access_token_expires,
                         extra_claims={
                             "role": staff.role.lower(),
                             "company_id": str(staff.company_id),
-                            "is_staff": True # Vital flag for deps.py
+                            "is_staff": True
                         }
                     ),
                     "token_type": "bearer",
                     "company_slug": user_in.company_slug
                 }
-        except Exception:
-            pass # Fallback to admin login or error out
+                await reset_search_path(db)
+                return token_data
+        except HTTPException:
+            await reset_search_path(db)
+            raise
+        except Exception as e:
+            logger.warning(f"Tenant login failed for {user_in.email} on {user_in.company_slug}: {e}")
+            await reset_search_path(db)
             
-    # 2. AUTH PATH B: Global Login (Admins - strictly in public.users)
-    from sqlalchemy.orm import selectinload
+    # PATH B: Global Login (Admins)
+    await reset_search_path(db)
     result = await db.execute(
         select(User)
         .where(User.email == user_in.email)
@@ -162,42 +225,31 @@ async def login(user_in: UserLogin, db: AsyncSession = Depends(get_db)) -> Any:
     )
     user = result.scalars().first()
     
-    if user:
-        # Check Admin credentials directly against the User table
-        if security.verify_password(user_in.password, user.password_hash):
-            access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-            return {
-                "access_token": security.create_access_token(
-                    user.user_id, 
-                    expires_delta=access_token_expires,
-                    extra_claims={
-                        "role": user.role,
-                        "company_id": str(user.company_id),
-                        "is_staff": False
-                    }
-                ),
-                "token_type": "bearer",
-                "company_slug": user.company.company_slug
-            }
+    if user and security.verify_password(user_in.password, user.password_hash):
+        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        return {
+            "access_token": security.create_access_token(
+                user.user_id, 
+                expires_delta=access_token_expires,
+                extra_claims={
+                    "role": user.role,
+                    "company_id": str(user.company_id),
+                    "is_staff": False
+                }
+            ),
+            "token_type": "bearer",
+            "company_slug": user.company.company_slug
+        }
 
     raise HTTPException(status_code=400, detail="Incorrect email or password")
-
-from app.api.deps import get_current_user
-from app.schemas.user import UserProfileOut
-from sqlalchemy.orm import selectinload
-from app.models.models import Staff
 
 @router.get("/me", response_model=UserProfileOut)
 async def get_me(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """Fetch profile and company info for the authenticated user.
-    Handles both Admin (User) and Staff login paths.
-    """
-    # Check if current_user is a Staff object (tenant staff login)
+    """Fetch profile and company info for the authenticated user."""
     if isinstance(current_user, Staff):
-        # Staff user — return a compatible shape for UserProfileOut
         return {
             "user_id": current_user.staff_id,
             "email": current_user.email or "",
@@ -206,18 +258,17 @@ async def get_me(
             "company": current_user.company
         }
     
-    # Admin user — reload with company relationship
-    result = await db.execute(
-        select(User)
-        .where(User.user_id == current_user.user_id)
-        .options(selectinload(User.company))
-    )
-    user = result.scalars().first()
-    if not user:
+    if not current_user.company:
+        result = await db.execute(
+            select(User)
+            .where(User.user_id == current_user.user_id)
+            .options(selectinload(User.company))
+        )
+        current_user = result.scalars().first()
+        
+    if not current_user:
         raise HTTPException(status_code=404, detail="User not found")
-    return user
-
-from app.schemas.user import UserUpdate
+    return current_user
 
 @router.put("/me", response_model=UserProfileOut)
 async def update_me(
@@ -225,28 +276,19 @@ async def update_me(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """Update profile info for the authenticated user"""
-    # Staff users cannot update profile through this endpoint
+    """Update profile info for the authenticated user."""
     if isinstance(current_user, Staff):
-        raise HTTPException(status_code=403, detail="Staff profile updates are not supported through this endpoint")
-    
-    result = await db.execute(select(User).where(User.user_id == current_user.user_id))
-    user = result.scalars().first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=403, detail="Staff profile updates not allowed here")
     
     update_data = user_in.model_dump(exclude_unset=True)
     for field, value in update_data.items():
-        setattr(user, field, value)
+        setattr(current_user, field, value)
         
     await db.commit()
-    
-    # Must explicitly refresh the relationships for Pydantic in asyncio
-    await db.refresh(user, attribute_names=["company", "email", "full_name", "role"])
-    return user
+    await db.refresh(current_user, attribute_names=["company"])
+    return current_user
 
-from app.api.deps import get_current_admin
-from app.schemas.user import CompanyUpdate, CompanyOut
+# --- Company Management ---
 
 @router.put("/company", response_model=CompanyOut)
 async def update_company(
@@ -270,10 +312,6 @@ async def update_company(
     await db.refresh(company)
     return company
 
-from fastapi import File, UploadFile
-import shutil
-from pathlib import Path
-
 @router.post("/company/logo", response_model=CompanyOut)
 async def upload_company_logo(
     file: UploadFile = File(...),
@@ -281,7 +319,6 @@ async def upload_company_logo(
     db: AsyncSession = Depends(get_db)
 ) -> Any:
     """Upload a company logo."""
-    # 1. Fetch company
     result = await db.execute(
         select(Company).where(Company.company_id == current_user.company_id)
     )
@@ -289,7 +326,6 @@ async def upload_company_logo(
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
         
-    # 2. Save file
     upload_dir = Path("static/uploads")
     upload_dir.mkdir(parents=True, exist_ok=True)
     
@@ -300,9 +336,6 @@ async def upload_company_logo(
     with file_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
         
-    # 3. Update company logo_url
-    # Use global URL or relative path? Frontend knows 8000 but it's better to store full or consistent partial path.
-    # In many setups, relative /static/uploads/... is fine.
     company.logo_url = f"/static/uploads/{file_name}"
     
     await db.commit()
@@ -322,7 +355,6 @@ async def delete_company_logo(
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
         
-    # Optional: Delete file from disk if exists
     if company.logo_url:
         file_path = Path(company.logo_url.lstrip("/"))
         if file_path.exists():
