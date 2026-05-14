@@ -185,20 +185,65 @@ async def login(user_in: UserLogin, db: AsyncSession = Depends(get_db)) -> Any:
 from app.api.deps import get_current_user
 from app.schemas.user import UserProfileOut
 from sqlalchemy.orm import selectinload
+from app.models.models import Staff
 
-@router.get("/me", response_model=UserProfileOut)
+@router.get("/me")
 async def get_me(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
-    """Fetch profile and company info for the authenticated user"""
-    # Force reload of user with joined company object
+    """Fetch profile and company info for the authenticated user.
+    Handles both Admin (User) and Staff login paths.
+    """
+    # Check if current_user is a Staff object (tenant staff login)
+    if isinstance(current_user, Staff):
+        # Staff user — return a compatible shape
+        return {
+            "user_id": str(current_user.staff_id),
+            "email": current_user.email or "",
+            "full_name": current_user.name,
+            "role": current_user.role,
+            "company": {
+                "company_id": str(current_user.company.company_id),
+                "company_name": current_user.company.company_name,
+                "company_slug": current_user.company.company_slug,
+                "industry": current_user.company.industry,
+                "currency": current_user.company.currency,
+                "currency_symbol": current_user.company.currency_symbol,
+                "timezone": current_user.company.timezone,
+                "brand_display_name": current_user.company.brand_display_name,
+                "address": current_user.company.address,
+                "logo_url": current_user.company.logo_url,
+                "status": current_user.company.status,
+                "fiscal_year_start": current_user.company.fiscal_year_start,
+                "default_sales_cycle": current_user.company.default_sales_cycle,
+                "tax_id": current_user.company.tax_id,
+                "whatsapp_api_key": current_user.company.whatsapp_api_key,
+                "whatsapp_sender_id": current_user.company.whatsapp_sender_id,
+                "daily_nudge_time": current_user.company.daily_nudge_time,
+                "ai_tone": current_user.company.ai_tone,
+                "primary_source": current_user.company.primary_source,
+                "sync_frequency": current_user.company.sync_frequency,
+                "source_url": current_user.company.source_url,
+                "integration_mappings": current_user.company.integration_mappings,
+                "last_sync_at": str(current_user.company.last_sync_at) if current_user.company.last_sync_at else None,
+                "staff_id_prefix": current_user.company.staff_id_prefix,
+                "staff_id_suffix": current_user.company.staff_id_suffix,
+                "staff_id_start_number": current_user.company.staff_id_start_number,
+                "staff_id_padding": current_user.company.staff_id_padding,
+                "staff_id_generation_mode": current_user.company.staff_id_generation_mode,
+            }
+        }
+    
+    # Admin user — reload with company relationship
     result = await db.execute(
         select(User)
         .where(User.user_id == current_user.user_id)
         .options(selectinload(User.company))
     )
     user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
     return user
 
 from app.schemas.user import UserUpdate
@@ -210,8 +255,14 @@ async def update_me(
     db: AsyncSession = Depends(get_db)
 ) -> Any:
     """Update profile info for the authenticated user"""
+    # Staff users cannot update profile through this endpoint
+    if isinstance(current_user, Staff):
+        raise HTTPException(status_code=403, detail="Staff profile updates are not supported through this endpoint")
+    
     result = await db.execute(select(User).where(User.user_id == current_user.user_id))
     user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
     
     update_data = user_in.model_dump(exclude_unset=True)
     for field, value in update_data.items():
