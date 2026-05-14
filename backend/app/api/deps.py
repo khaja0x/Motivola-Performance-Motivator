@@ -1,9 +1,12 @@
 from typing import Generator, Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from jose import jwt, JWTError
+from jose import jwt, JWTError # pyrefly: ignore [missing-import]
+# pyrefly: ignore [missing-import]
 from sqlalchemy.ext.asyncio import AsyncSession
+# pyrefly: ignore [missing-import]
 from sqlalchemy import select, text
+# pyrefly: ignore [missing-import]
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
@@ -49,24 +52,33 @@ async def get_current_user(
             
     # 2. PATH: Tenant Staff (found in tenant schema)
     if token_data.company_id:
-        from app.models.models import Company, Staff
+        from app.models.models import Company, Staff # pyrefly: ignore [missing-import]
         # Find company to get its slug
         c_result = await db.execute(select(Company).where(Company.company_id == token_data.company_id))
         company = c_result.scalars().first()
         
         if company:
             schema_name = f"tenant_{company.company_slug}"
-            await db.execute(text(f'SET search_path TO "{schema_name}", public'))
-            
-            s_result = await db.execute(select(Staff).where(Staff.staff_id == token_data.sub))
-            staff = s_result.scalars().first()
-            
-            if staff:
-                # To maintain compatibility with existing API code that expects a User object:
-                # We return a hybrid object or just ensure it has the same fields.
-                # Actually, many things use current_user.company_id, .role, etc.
-                staff.company = company # Ensure backlink works
-                return staff # In Python, this will work if code only assumes common fields
+            try:
+                await db.execute(text(f'SET search_path TO "{schema_name}", public'))
+                
+                s_result = await db.execute(select(Staff).where(Staff.staff_id == token_data.sub))
+                staff = s_result.scalars().first()
+                
+                if staff:
+                    # To maintain compatibility with existing API code that expects a User object:
+                    # We return a hybrid object or just ensure it has the same fields.
+                    # Actually, many things use current_user.company_id, .role, etc.
+                    staff.company = company # Ensure backlink works
+                    return staff # In Python, this will work if code only assumes common fields
+            except Exception as e:
+                # Check if it's a "schema does not exist" error
+                if "does not exist" in str(e).lower():
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Tenant schema '{schema_name}' not found. Please run the provisioning script."
+                    )
+                raise e
 
     raise credentials_exception
 
@@ -97,6 +109,14 @@ async def get_tenant_db(
         raise HTTPException(status_code=404, detail="User company not found")
         
     schema_name = f"tenant_{current_user.company.company_slug}"
-    # Setting search_path so the tenant schema takes priority over public
-    await db.execute(text(f'SET search_path TO "{schema_name}", public'))
+    try:
+        # Setting search_path so the tenant schema takes priority over public
+        await db.execute(text(f'SET search_path TO "{schema_name}", public'))
+    except Exception as e:
+        if "does not exist" in str(e).lower():
+             raise HTTPException(
+                status_code=404, 
+                detail=f"Database schema for '{current_user.company.company_name}' is not provisioned. Contact support."
+            )
+        raise e
     yield db
